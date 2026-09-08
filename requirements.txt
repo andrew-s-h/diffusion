@@ -1,0 +1,10 @@
+# DDPM from scratch — dependency lockfile
+# Python >= 3.14
+# Verified against PyPI latest stable, 2026-08-17
+
+torch==2.13.0
+torchvision==0.28.0    # metadata pins torch==2.13.0 — pair is matched
+datasets==5.0.1        # HuggingFace datasets — used for flwrlabs/celeba
+matplotlib==3.11.1
+pillow==12.3.0
+numpy==2.5.2
