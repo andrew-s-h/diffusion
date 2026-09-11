@@ -224,10 +224,88 @@ class Gaussian_Diffusion(nn.Module):
 
         b = x_0.shape[0]
 
-        t = torch.randint(0, self.timesteps, (b, ), device = x0.device, dtype=torch.long)
+        t = torch.randint(0, self.timesteps, (b, ), device = x_0.device, dtype=torch.long)
 
         eps = torch.randn_like(x_0)
         x_t = self.q_sample(x_0, t, eps)
         eps_hat = self.model(x_t, t)
         return F.mse_loss(eps_hat, eps)
+
+# ======================================
+# eps_theta network: UNet used for noise prediction with time conditioning
+#
+# =======================================
+
+class Sinusoidal_Time_Embedding(nn.Module):
+    """
+    Maps timesteps to fixed featured vetors using a sinusoidal time embeding
+
+    Indexed by integer diffusion step t with h = dim/2
+
+        omega_i = exp(-ln(1000) * i / (h - 1)), i = 0...h-1
+        emb(t) = [sin(omega_0)]
+    """
+
+    def __init__(self, dim:int):
+        super().__init__()
+        # sin/cos pairs so need following check...
+        assert dim % 2 == 0 
+
+        half = dim//2 
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32) 
+                          / (half - 1))
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            t (torch.Tensor): (B,) long timestep indices
+        
+        Returns:
+            torch.Tensor: (B, dim) float32 embeddings
+        """
+        # (B, 1) * (1, half) -> (B, half)
+        angles = t.float()[:, None] * self.freqs[None, :]
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim =-1)
+
+class Residual_block(nn.Module):
+    """
+    Group norm -> Sigmoid -> Conv
+
+    Args:
+        in_ch (int): input channels
+        out_ch (int): output channels
+        time_dim (int): width of shared time embedding vector
+        dropout (float): dropout prob before second conv. Default 0.1
+    """
+    def __init__(self, in_ch: int, out_ch: int, time_dim: int, dropout: float = 0.1):
+        super().__init__
+
+        self.norm1 = nn.GroupNorm(num_groups=32,num_channels=in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+
+        self.time_proj = nn.Linear(time_dim, out_ch)
+
+        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_ch)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): (B, in_ch, H, W)
+            t_emb (torch.Tensor): (B, time_dim) shared time embedding
+
+        Returns:
+            torch.Tensor: (B, out_ch, H, W)
+        """
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = h + self.time_proj(F.silu(t_emb))[:, :, None, None]
+        h = self.conv2(self.dropout(F.silu(self.norm2(h))))
+        return h + self.skip(x)
 
