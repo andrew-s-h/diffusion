@@ -279,12 +279,12 @@ class Residual_block(nn.Module):
         dropout (float): dropout prob before second conv. Default 0.1
     """
     def __init__(self, in_ch: int, out_ch: int, time_dim: int, dropout: float = 0.1):
-        super().__init__
+        super().__init__()
 
         self.norm1 = nn.GroupNorm(num_groups=32,num_channels=in_ch)
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
 
-        self.time_proj = nn.Linear(time_dim, out_ch)
+        self.time_proj = nn.Linear(in_features=time_dim, out_features=out_ch)
 
         self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_ch)
         self.dropout = nn.Dropout(dropout)
@@ -309,3 +309,167 @@ class Residual_block(nn.Module):
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
         return h + self.skip(x)
 
+class Self_Attention_Block(nn.Module):
+    """ UNet drops one of these after every ResBlock sitting at a resolution listed in attn_resolutions 
+    -- just (16,) by default -- plus one between the two middle ResBlocks, which is always there regardless
+    of that setting. Six in the default network: two in the encoder, three in the decoder, one in the middle at 8x8.
+
+    Args:
+        ch (int): channels
+        num_heads (int): attention heads; Default 4. Channels must be divisible by num_heads
+    """
+    def __init__(self, ch:int, num_heads: int=4):
+        super().__init__
+        assert ch % num_heads == 0
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(32, ch)
+
+        # 1x1 filter at each position independently: linear in the channel
+        # vector, no spatial aggregation. c -> 3c stacks q,k,v into one matmul.
+        self.qkv = nn.Conv2d(ch, 3 * ch, kernel_size=1)
+
+        # W_o, each head wrote into its own slice of channels 
+        self.proj = nn.Conv2d(ch, ch, kernel_size=1)
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x:torch.tensor) -> torch.Tensor: 
+        """
+        Args:
+            x (torch.Tensor): (B, ch, H, W)
+
+        Returns: 
+            torch.Tensor: (B, ch, H, W)
+        """
+        b, c, h_, w_ = x.shape
+        n = h_ * w_
+        head = c // self.num_heads
+
+        qkv = self.qkv(self.norm(x)) # (B,  3c, H, W)
+
+        qkv = qkv.reshape(b, 3, self.num_heads, head, n) # (B, 3, num_heads, head, n)
+        qkv = qkv.permute(1, 0, 2, 4, 3) # (3, B, num_heads, n= hw, head)
+        q, k, v = qkv[0], qkv[1], qkv[2] # each (B, heads, HW, head)
+
+        # returns output. The weights softmas(q * k^T / sqrt(head)) is computed internally
+        # this is a fused kernel, (B,heads,HW,HW) score matrix is never materialized
+ 
+        out = F.scaled_dot_product_attention(q, k, v) # (B, heads, HW, head)
+        out = out.permute(0, 1, 3, 2).reshape(b, c, h_, w_)
+        return x + self.proj(out)
+
+class Downsample(nn.Module):
+        """Halves H and W with a stride-2 3x3 conv (learned reduction, Ho et al.)
+        """
+        def __init__(self, ch: int):
+            super().__init__()
+            self.conv = nn.Conv2d(ch, ch, kernel_size=3, stride=2, padding=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.conv(x)
+
+class Upsample(nn.Module):
+        """Doubles H and W: nearest-neighbor x2 then a 3x3 conv"""
+        def __init__(self, ch: int):
+            super().__init__()
+            self.conv == nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.conv(F.interpolate(x, scale_factor=2.0, mode="nearest"))
+
+
+class UNet(nn.Module):
+    """
+    Noise-prediction network eps_theta(x_t, t)
+    
+    Encoder halves the resultion at each level, and a middle block sits at the coarsest resolution,
+    and a decoder is used to mirror the encoder. The decoder runs num_res_block + 1 ResBlocks per level 
+
+
+    Args:
+        in_ch (int): image channels. Default 3
+        base_ch (int): channels at full resolution; multiple of 32 (GroupNorm).
+            Default 128
+        ch_mults (tuple): per-level multipliers of base_ch; each entry after the first adds one 2x downsample.
+            Default (1, 2, 2, 2)
+        num_res_block (int): ResBlocks per encoder level. Default 2
+        attn_resolutions (tuple): spatial sizes where attention is added for resblocks. Default (16, )
+        img_size (int): input resolution, used only to know which level is at
+        
+
+    """
+    def __init__(self, in_ch: int = 3, base_ch: int = 128,
+                 ch_mults: tuple = (1,2,2,2), num_res_blocks: int = 2,
+                 attn_resolutions: tuple = (16,), img_size: int = 64, 
+                 dropout: float = 0.1):
+        super().__init__()
+
+        # number of stages for the encoder/decoder
+        self.num_levels = len(ch_mults)
+        time_dim = base_ch * 4
+
+        def make_res(cin, cout, res):
+            block = Residual_block(cin, cout, time_dim, dropout)
+            attn = Self_Attention_Block(ch=cout) if res in attn_resolutions else nn.Identity()
+            return nn.ModuleList([block, attn])
+
+        self.time_mlp = nn.Sequential(
+            Sinusoidal_Time_Embedding(base_ch),
+            nn.Linear(base_ch, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        # 'lift RGB' into feature channels 
+        self.stem = nn.Conv2d(in_ch, base_ch, kernel_size=3, padding=1)
+
+        # ----------- Encoder -------------
+        # the encoder's ordered container is self.down
+        self.down = nn.ModuleList()
+        # skip_chs keeps track of every activation the encoder pushes
+        # so the decoder can be built w matchign widths
+        skip_chs = [base_ch]
+        ch = base_ch
+        res = img_size
+
+        for level, mult in enumerate(ch_mults):
+            out_ch = base_ch * mult
+            for _ in range(num_res_blocks):
+                self.down.append(make_res(ch, out_ch, res))
+                ch = out_ch
+                skip_chs.append(ch)
+            # for default case true for levels 0, 1, 2
+            if level != self.num_levels - 1:
+                self.down.append(Downsample(ch))
+                skip_chs.append(ch)
+                # bookeeping res, actual change in stride 2 downsample
+                # H and W must be even 
+                res //= 2
+
+        # ----------- Bottom U-Net -----------
+
+        self.mid_block1 = Residual_block(ch, ch, time_dim, dropout)
+        self.mid_attn = Self_Attention_Block(ch)
+        self.mid_block2 = Residual_block(ch, ch, time_dim, dropout)
+
+        # ----------- Decoder -----------
+        self.up = nn.ModuleList()
+        for level, mult in reversed(list(enumerate(ch_mults))):
+            out_ch = base_ch * mult
+
+            # decoder uses 3 resblocks per level 
+            for _ in range(num_res_blocks + 1):
+                self.up.append(make_res(ch + skip_chs.pop(), out_ch, res))
+                ch = out_ch
+
+            if level != 0:
+                self.up.append(Upsample(ch))
+                res *= 2
+
+        # last layer/op set 
+        # this will return eps_hat
+        self.out_norm = nn.GroupNorm(32, ch)
+        self.out_conv = nn.Conv2d(ch, out_channels=in_ch, kernel_size=3, padding=1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)

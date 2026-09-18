@@ -5,3 +5,4 @@ scratch.py
 *.npy
 .DS_Store
 __pycache__/
+test_ddpm.py
