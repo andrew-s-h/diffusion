@@ -2,8 +2,7 @@
 data/
 ddpm_0clwd.py
 scratch.py
-.venv/
-data/
 *.npy
 .DS_Store
 __pycache__/
+test_ddpm.py
