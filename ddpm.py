@@ -1,8 +1,12 @@
+import copy
 import math
+import os 
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.utils import save_image
 
 class Gaussian_Diffusion(nn.Module):
     """Discrete-time denoising diffusion probability model: schedule,
@@ -242,7 +246,7 @@ class Sinusoidal_Time_Embedding(nn.Module):
 
     Indexed by integer diffusion step t with h = dim/2
 
-        omega_i = exp(-ln(1000) * i / (h - 1)), i = 0...h-1
+        omega_i = exp(-ln(10000) * i / (h - 1)), i = 0...h-1
         emb(t) = [sin(omega_0)]
     """
 
@@ -270,7 +274,7 @@ class Sinusoidal_Time_Embedding(nn.Module):
 
 class Residual_block(nn.Module):
     """
-    Group norm -> Sigmoid -> Conv
+    Group norm -> SiLU -> Conv
 
     Args:
         in_ch (int): input channels
@@ -319,7 +323,7 @@ class Self_Attention_Block(nn.Module):
         num_heads (int): attention heads; Default 4. Channels must be divisible by num_heads
     """
     def __init__(self, ch:int, num_heads: int=4):
-        super().__init__
+        super().__init__()
         assert ch % num_heads == 0
         self.num_heads = num_heads
         self.norm = nn.GroupNorm(32, ch)
@@ -373,7 +377,7 @@ class Upsample(nn.Module):
         """Doubles H and W: nearest-neighbor x2 then a 3x3 conv"""
         def __init__(self, ch: int):
             super().__init__()
-            self.conv == nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+            self.conv = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return self.conv(F.interpolate(x, scale_factor=2.0, mode="nearest"))
@@ -473,3 +477,73 @@ class UNet(nn.Module):
         self.out_conv = nn.Conv2d(ch, out_channels=in_ch, kernel_size=3, padding=1)
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Predicts the noised mixed into x_t
+
+        Args:
+            x (torch.Tensor): (B, in_ch, H, W) noised images x_t; H, W both divisible
+            by 2^(num_levels - 1)
+
+            t (torch.Tensor): (B, ) long timstep indices
+
+        Returns:
+            torch.Tensor: (N, in_ch, H, W) predicted noise eps_hat
+        """
+        t_emb = self.time_mlp(t)
+        h = self.stem(x)
+        skips = [h]
+
+        for entry in self.down:
+            if isinstance(entry, Downsample):
+                h = entry(h)
+            else:
+                block, attn = entry
+                # block is resblock
+                # resblock forward(self, x, t_emb)
+                h = attn(block(h, t_emb))
+            skips.append(h)
+
+        h = self.mid_block1(h, t_emb)
+        h = self.mid_attn(h)
+        h = self.mid_block2(h, t_emb)
+
+        for entry in self.up:
+            if isinstance(entry, Upsample):
+                h = entry(h)
+            else:
+                block, attn = entry
+                h = torch.cat([h, skips.pop()], dim=1)
+                h = attn(block(h, t_emb))
+
+        assert not skips, "every pushed skip should be popped"
+        
+        return self.out_conv(F.silu(self.out_norm(h)))
+
+
+class EMA:
+    """Exponential movin average of model parameters
+    
+    DDPM Samples drawn from EMA wights; Ho et al. use decay 0.9999.
+
+    Averaging smooths the noise that Adam's per-step updates put into
+    the weight, which will provide better sample quality.
+        shadow <- decay * shadow + (1-decay) * param
+    
+    Args:
+        model (nn.Module): the live model to track
+        decay (float): EMA decay. Default 0.9999 
+    
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model).eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for s, p in zip(self.shadow.parameters(), model.parameters()):
+            # takes a step towards live weights
+            # s = s + (1-decay) * (p-s)
+            s.lerp_(p, 1.0 - self.decay)
