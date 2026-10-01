@@ -8,3 +8,7 @@ datasets==5.0.1        # HuggingFace datasets — used for flwrlabs/celeba
 matplotlib==3.11.1
 pillow==12.3.0
 numpy==2.5.2
+
+# dev tools (added 2026-09-23)
+pytest==9.1.1          # test runner
+ruff==0.16.8           # linter
