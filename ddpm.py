@@ -128,8 +128,8 @@ class Gaussian_Diffusion(nn.Module):
             mean = posterior_mean_coef1[t] * x_0 +posterior_mean_coef2[t] * x_t
             variance = b_tilde_t
 
-        The Bayes derivation is exact for true x_0. nit the sampler has no true x_0.
-        Thus, we pass in x_0_hat from predict_x0_from_eps
+        The Bayes derivation is exact for true x_0. but the sampler has no true x_0.
+        So x_0_hat from predict_x0_from_eps should usually be passed in. 
 
         Args:
             x_0 (torch.tensor): (B, C, H, W) clean images. x_0_hat in practice
