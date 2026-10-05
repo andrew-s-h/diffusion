@@ -2,7 +2,7 @@
 
 Samples and saved weights come from the EMA copy, following Ho et al.
 """
-import json
+import csv
 import math
 import os
 import time
@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from ddpm import EMA, Gaussian_Diffusion, UNet
 from load_data import CelebaMemmap
 
-STEPS = 50000
+STEPS = 150_000
 BATCH_SIZE = 24
 LR = 2e-4
 WARMUP = 2000
@@ -24,6 +24,7 @@ EMA_DECAY = 0.9995
 LOG_EVERY = 250
 SAMPLE_EVERY = 2500
 CKPT_EVERY = 1000
+EMA_CKPT_EVERY = 25_000
 N_SAMPLES = 6
 OUT_DIR = os.path.join("runs", "ddpm_50k")
 RESUME = os.path.join("runs", "ddpm_50k", "last.pt")
@@ -42,8 +43,6 @@ def train() -> None:
     torch.manual_seed(0)
     device = pick_device()
     os.makedirs(OUT_DIR, exist_ok=True)
-
-    # num_workers=0: on macOS each worker would get its own ~2 GB copy of the memmap
     data = CelebaMemmap().dataset("train")
     loader = DataLoader(data, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, drop_last=True)
 
@@ -71,6 +70,10 @@ def train() -> None:
         step = ck["step"]
         print(f"resumed at step {step}")
 
+    # reseed per resume point; seeding 0 again would replay the first epoch's
+    # shuffle order and t/eps draws. Must run before the loader iterator is created.
+    torch.manual_seed(step)
+
     def save_ckpt():
         state = {
             "model": model.state_dict(),
@@ -84,8 +87,11 @@ def train() -> None:
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
 
-    # one JSON object per line, appended, so a crash or resume never loses earlier entries
-    log_path = os.path.join(OUT_DIR, "log.jsonl")
+    # appended, so a crash or resume never loses earlier rows; header only on first creation
+    log_path = os.path.join(OUT_DIR, "log.csv")
+    if not os.path.exists(log_path):
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(["step", "loss", "lr", "ema_decay", "elapsed_s"])
 
     model.train()
     running = 0.0
@@ -108,11 +114,11 @@ def train() -> None:
 
             running += loss.item()
             if step % LOG_EVERY == 0:
-                print(f"step {step:>7d} | loss {running / LOG_EVERY:.4f} | {time.time() - t0:.0f}s", flush=True)
-                with open(log_path, "a") as f:
-                    f.write(json.dumps({"step": step, "loss": running / LOG_EVERY,
-                                        "lr": sched.get_last_lr()[0], "ema_decay": ema.decay,
-                                        "elapsed_s": round(time.time() - t0, 1)}) + "\n")
+                avg = running / LOG_EVERY
+                elapsed = round(time.time() - t0, 1)
+                print(f"step {step:>7d} | loss {avg:.4f} | {elapsed:.0f}s", flush=True)
+                with open(log_path, "a", newline="") as f:
+                    csv.writer(f).writerow([step, avg, sched.get_last_lr()[0], ema.decay, elapsed])
                 running = 0.0
 
             if step % SAMPLE_EVERY == 0:
@@ -122,6 +128,9 @@ def train() -> None:
 
             if step % CKPT_EVERY == 0:
                 save_ckpt()
+
+            if step % EMA_CKPT_EVERY == 0:
+                torch.save(ema.shadow.state_dict(), os.path.join(OUT_DIR, f"ema_{step:07d}.pt"))
 
             if step >= STEPS:
                 break
