@@ -26,7 +26,7 @@ SAMPLE_EVERY = 2500
 CKPT_EVERY = 1000
 N_SAMPLES = 6
 OUT_DIR = os.path.join("runs", "ddpm_50k")
-RESUME = None
+RESUME = os.path.join("runs", "ddpm_50k", "last.pt")
 
 
 def pick_device() -> str:
