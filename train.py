@@ -2,7 +2,7 @@
 
 Samples and saved weights come from the EMA copy, following Ho et al.
 """
-import csv
+import json
 import math
 import os
 import time
@@ -26,8 +26,8 @@ SAMPLE_EVERY = 2500
 CKPT_EVERY = 1000
 EMA_CKPT_EVERY = 25_000
 N_SAMPLES = 6
-OUT_DIR = os.path.join("runs", "ddpm_50k")
-RESUME = os.path.join("runs", "ddpm_50k", "last.pt")
+OUT_DIR = os.path.join("runs", "ddpm_150k")
+RESUME = os.path.join(OUT_DIR, "last.pt")
 
 
 def pick_device() -> str:
@@ -87,11 +87,8 @@ def train() -> None:
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
 
-    # appended, so a crash or resume never loses earlier rows; header only on first creation
-    log_path = os.path.join(OUT_DIR, "log.csv")
-    if not os.path.exists(log_path):
-        with open(log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["step", "loss", "lr", "ema_decay", "elapsed_s"])
+    # one JSON object per line, appended, so a crash or resume never loses earlier entries
+    log_path = os.path.join(OUT_DIR, "log.jsonl")
 
     model.train()
     running = 0.0
@@ -117,8 +114,10 @@ def train() -> None:
                 avg = running / LOG_EVERY
                 elapsed = round(time.time() - t0, 1)
                 print(f"step {step:>7d} | loss {avg:.4f} | {elapsed:.0f}s", flush=True)
-                with open(log_path, "a", newline="") as f:
-                    csv.writer(f).writerow([step, avg, sched.get_last_lr()[0], ema.decay, elapsed])
+                with open(log_path, "a") as f:
+                    f.write(json.dumps({"step": step, "loss": avg,
+                                        "lr": sched.get_last_lr()[0], "ema_decay": ema.decay,
+                                        "elapsed_s": elapsed}) + "\n")
                 running = 0.0
 
             if step % SAMPLE_EVERY == 0:
