@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from ddpm import EMA, Gaussian_Diffusion, UNet
 from load_data import CelebaMemmap
 
-STEPS = 150_000
+STEPS = 250_000
 BATCH_SIZE = 24
 LR = 2e-4
 WARMUP = 2000
