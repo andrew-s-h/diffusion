@@ -41,7 +41,7 @@ I chose CelebA because it’s small and popular, and face quality is easy to jud
 
 ### Evaluation protocol
 
-All numbers come from `eval.py` and are stored in `runs/ddpm_150k/eval/results.json`.
+All numbers come from `eval.py`; raw results are in [`results/results.json`](results/results.json).
 
 - **Checkpoints.** EMA weights every 25k steps from 75k to 400k, and raw (live) weights at 100k,
   163k, 250k and 400k.
