@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from ddpm import EMA, Gaussian_Diffusion, UNet
 from load_data import CelebaMemmap
 
-STEPS = 250_000
+STEPS = 400_000
 BATCH_SIZE = 24
 LR = 2e-4
 WARMUP = 2000
@@ -61,7 +61,7 @@ def train() -> None:
     ema_diffusion.to(device)
 
     step = 0
-    if RESUME is not None:
+    if RESUME is not None and os.path.exists(RESUME):
         ck = torch.load(RESUME, map_location=device)
         model.load_state_dict(ck["model"])
         ema.shadow.load_state_dict(ck["ema"])
